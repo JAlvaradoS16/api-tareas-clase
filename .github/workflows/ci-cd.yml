@@ -1,4 +1,4 @@
-name: CI/CD
+name: CI
 on:
   push:
     branches: [main]
@@ -86,4 +86,4 @@ jobs:
         run: docker run -d --name api -p 8080:8000 -e APP_ENV=produccion "$IMAGEN"
       - name: Smoke test
         run: bash scripts/smoke.sh http://localhost:8080
-  
+    
