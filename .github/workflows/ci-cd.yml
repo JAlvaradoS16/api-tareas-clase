@@ -4,6 +4,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      version_rota:
+        description: "Laboratorio: desplegar una versión que no arranca en producción"
+        type: boolean
+        default: false    
 jobs:
   ci:
     name: CI
@@ -30,6 +36,24 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Calcular nombre de la imagen
+        id: nombre
+        env:
+          ROTA: ${{ inputs.version_rota }}
+        # GHCR exige minúsculas; ${VAR,,} las convierte en Bash.
+        # La versión rota lleva otra etiqueta: nunca pisa la imagen buena de un SHA.
+        run: |
+          ETIQUETA="$GITHUB_SHA"
+          if [ "$ROTA" = "true" ]; then ETIQUETA="rota-$GITHUB_RUN_ID"; fi
+          echo "imagen=ghcr.io/${GITHUB_REPOSITORY,,}:$ETIQUETA" >> "$GITHUB_OUTPUT"
+      - name: "Solo para el laboratorio: romper la versión"
+        if: inputs.version_rota
+        # Agrega una línea a app/__init__.py: la API no arranca en producción.
+        # Staging no cambia.
+        run: |
+          sed -i '/^    cfg = config or Config.desde_entorno()$/a\
+              if cfg.ambiente == "produccion": raise RuntimeError("Version rota")' app/__init__.py
+          if git diff --quiet; then echo "No se pudo romper la versión"; exit 1; fi
+          git diff
         id: nombre
         # GHCR exige minúsculas; ${VAR,,} las convierte en Bash.
         run: echo "imagen=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
@@ -86,4 +110,44 @@ jobs:
         run: docker run -d --name api -p 8080:8000 -e APP_ENV=produccion "$IMAGEN"
       - name: Smoke test
         run: bash scripts/smoke.sh http://localhost:8080
-    
+  rollback:
+    name: Rollback automático en producción
+    needs: produccion
+    # Solo si falló producción. Si falló antes (por ejemplo staging), producción nunca cambió.
+    if: failure() && needs.produccion.result == 'failure'
+    runs-on: ubuntu-latest
+    # Para leer APP_ENV y API_TOKEN de produccion.
+    # Como produccion tiene revisor, este job también espera la aprobación.
+    environment: produccion
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Buscar el último SHA que pasó producción
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA=$(gh run list --workflow ci-cd.yml --branch main --status success \
+                --limit 1 --json headSha --jq '.[0].headSha')
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "No hay una versión buena anterior"; exit 1; }
+          echo "Se vuelve a $SHA"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+          echo "IMAGEN=ghcr.io/${GITHUB_REPOSITORY,,}:$SHA" >> "$GITHUB_ENV"
+      - name: Iniciar sesión en GHCR
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Desplegar la versión anterior
+        env:
+          APP_ENV: ${{ vars.APP_ENV || 'produccion' }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: docker run -d --name api -p 8080:8000 -e APP_ENV -e API_TOKEN "$IMAGEN"
+      - name: Smoke test
+        run: |
+          bash scripts/smoke.sh http://localhost:8080
+          curl -fsS http://localhost:8080/version | grep -q "$SHA"
+          echo "OK producción volvió a $SHA"
+      - name: Ver el arranque del contenedor
+        run: docker logs api    
